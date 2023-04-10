@@ -6,7 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+lazy_static = "1.4.0"
 ssh2 = "0.9.4"
+thiserror = "1.0.40"
 tokio = { version = "1.27.0", features = [
     "sync",
     "rt",
