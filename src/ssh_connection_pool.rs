@@ -2,7 +2,11 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     path::Path,
-    sync::{Arc, Mutex},
+    result,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -73,7 +77,7 @@ impl SSHConnection {
         Some(Self { session })
     }
 
-    pub fn ssh(&self, command: String) -> Result<String> {
+    pub fn ssh(&self, command: &String) -> Result<String> {
         let mut channel = self.session.channel_session()?;
         channel.exec(command.as_str())?;
         let mut err = String::new();
@@ -84,7 +88,7 @@ impl SSHConnection {
 
             Ok(buf)
         } else {
-            Err(Error::SshCommandError(command, err))
+            Err(Error::SshCommandError(command.clone(), err))
         };
         channel.wait_close()?;
 
@@ -105,6 +109,36 @@ impl SSHConnection {
                 Ok(String::new())
             }
             Err(e) => Err(error::Error::Ssh(e)),
+        }
+    }
+
+    pub fn ssh_stream(&self, command: String, sender: Sender<String>) -> Result<String> {
+        let mut channel = self.session.channel_session()?;
+        let t = thread::spawn(move || {
+            let mut buf = [0_u8; 1024];
+            channel.exec(command.as_str()).unwrap();
+            loop {
+                match channel.read(&mut buf) {
+                    Ok(size) if size > 0 => {
+                        sender
+                            .send(String::from_utf8_lossy(&buf).to_string())
+                            .unwrap();
+                        buf.fill(0_u8);
+                    }
+                    Ok(_) => {
+                        println!("end of file");
+                        return Ok(String::from("eof"));
+                    }
+                    Err(e) => {
+                        return Err(Error::IO(e));
+                    }
+                }
+            }
+        });
+
+        match t.join() {
+            Ok(res) => res,
+            Err(_) => Err(Error::ThreadError()),
         }
     }
 
@@ -132,11 +166,17 @@ impl SSHConnectionPool {
     where
         C: Fn(Result<String>) + Send + 'static,
     {
-        let run = move || {
+        let run = move || loop {
             let connection = Self::get_connection();
-            let result = connection.ssh(command);
-            Self::return_connection(connection);
-            result
+            match connection.ssh(&command) {
+                Ok(result) => {
+                    Self::return_connection(connection);
+                    break Ok(result);
+                }
+                Err(e) => {
+                    println!("scp file error: {:?}", e);
+                }
+            }
         };
         let _ = self.thread_pool().execute(run, callback);
     }
@@ -152,7 +192,7 @@ impl SSHConnectionPool {
 
         let connection = connection.unwrap();
         let run = move || {
-            let result = connection.ssh(command);
+            let result = connection.ssh(&command);
             Self::return_connection(connection);
             result
         };
@@ -166,17 +206,19 @@ impl SSHConnectionPool {
         C: Fn(Result<String>) + Send + 'static,
     {
         let run = move || {
-            let connection = Self::get_connection();
             let result = loop {
+                let connection = Self::get_connection();
                 thread::sleep(Duration::from_secs(1));
                 match connection.scp(&content, &dest_path) {
-                    Ok(result) => break Ok(result),
+                    Ok(result) => {
+                        Self::return_connection(connection);
+                        break Ok(result);
+                    }
                     Err(e) => {
                         println!("scp file error: {:?}", e);
                     }
                 }
             };
-            Self::return_connection(connection);
             result
         };
         self.thread_pool().execute(run, callback);
@@ -201,6 +243,28 @@ impl SSHConnectionPool {
 
         true
     }
+
+    // pub fn ssh_stream<R>(&self, command: String, recv_callback: R)
+    // where
+    //     R: Fn(Mutex<Receiver<String>>) + Send + 'static,
+    // {
+    //     let run = move || loop {
+    //         let connection = Self::get_connection();
+    //         let (sender, receiver) = mpsc::channel::<String>();
+    //         let receiver = Mutex::new(receiver);
+    //         thread::spawn(|| recv_callback(receiver));
+    //         match connection.ssh_stream(command.clone(), sender) {
+    //             Ok(res) => {
+    //                 Self::return_connection(connection);
+    //                 break Ok(res);
+    //             }
+    //             Err(e) => {
+    //                 println!("ssh stream error: {:?}", e);
+    //             }
+    //         }
+    //     };
+    //     self.thread_pool.execute(run, |_| {});
+    // }
 
     fn get_connection() -> SSHConnection {
         let mut connections = CONNECTIONS.lock().unwrap();

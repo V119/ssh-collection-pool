@@ -8,4 +8,7 @@ pub enum Error {
 
     #[error("exec command [{0}] error, message: [{1}]")]
     SshCommandError(String, String),
+
+    #[error("thread error")]
+    ThreadError(),
 }
