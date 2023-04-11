@@ -1,14 +1,16 @@
 use std::{
-    io::Read,
+    io::{Read, Write},
     net::TcpStream,
+    path::Path,
     sync::{Arc, Mutex},
-    time::SystemTime,
+    thread,
+    time::Duration,
 };
 
 use ssh2::Session;
 
 use crate::{
-    error::Error,
+    error::{self, Error},
     thread_pool::{self, ThreadPool},
 };
 
@@ -22,12 +24,16 @@ type Result<T> = std::result::Result<T, Error>;
 
 lazy_static! {
     static ref CONNECTIONS: Arc<Mutex<Vec<SSHConnection>>> = {
-        let mut connections = Vec::new();
-        for _ in 0..MAX_CONNECTIONS {
-            connections.push(SSHConnection::new());
+        let mut connections = Vec::<SSHConnection>::new();
+        for i in 0..MAX_CONNECTIONS {
+            match SSHConnection::new() {
+                Some(connection) => connections.push(connection),
+                None => {
+                    println!("init connection {i} none value, continue");
+                    continue;
+                }
+            }
         }
-
-        println!("connection init");
 
         Arc::new(Mutex::new(connections))
     };
@@ -38,14 +44,33 @@ struct SSHConnection {
 }
 
 impl SSHConnection {
-    pub fn new() -> Self {
-        let tcp = TcpStream::connect(SSH_HOST).unwrap();
-        let mut session = Session::new().unwrap();
+    pub fn new() -> Option<Self> {
+        let tcp = match TcpStream::connect(SSH_HOST) {
+            Ok(value) => value,
+            Err(e) => {
+                println!("tcp connection error: {:?}", e);
+                return None;
+            }
+        };
+
+        let mut session = match Session::new() {
+            Ok(value) => value,
+            Err(e) => {
+                println!("session create error: {:?}", e);
+                return None;
+            }
+        };
         session.set_tcp_stream(tcp);
         session.handshake().unwrap();
         session.set_timeout(TIMEOUT);
-        session.userauth_password(USER_NAME, PASSWORD).unwrap();
-        Self { session }
+        match session.userauth_password(USER_NAME, PASSWORD) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("user auth error: {:?}", e);
+                return None;
+            }
+        };
+        Some(Self { session })
     }
 
     pub fn ssh(&self, command: String) -> Result<String> {
@@ -65,6 +90,27 @@ impl SSHConnection {
 
         res
     }
+
+    pub fn scp(&self, content: &String, dest_path: &String) -> Result<String> {
+        let remote_file =
+            self.session
+                .scp_send(Path::new(&dest_path), 0o777, content.len() as u64, None);
+        match remote_file {
+            Ok(mut remote_file) => {
+                remote_file.write_all(content.as_bytes()).unwrap();
+                remote_file.send_eof().unwrap();
+                remote_file.wait_eof().unwrap();
+                remote_file.close().unwrap();
+                remote_file.wait_close().unwrap();
+                Ok(String::new())
+            }
+            Err(e) => Err(error::Error::Ssh(e)),
+        }
+    }
+
+    pub fn authenticated(&self) -> bool {
+        self.session.authenticated()
+    }
 }
 
 pub struct SSHConnectionPool {
@@ -82,55 +128,187 @@ impl SSHConnectionPool {
         &self.thread_pool
     }
 
-    pub fn ssh(&self, command: String) {
+    pub fn ssh<C>(&self, command: String, callback: C)
+    where
+        C: Fn(Result<String>) + Send + 'static,
+    {
         let run = move || {
             let connection = Self::get_connection();
             let result = connection.ssh(command);
             Self::return_connection(connection);
             result
         };
+        let _ = self.thread_pool().execute(run, callback);
+    }
+
+    pub fn try_ssh<C>(&self, command: String, callback: C) -> bool
+    where
+        C: Fn(Result<String>) + Send + 'static,
+    {
+        let connection = Self::try_get_connection();
+        if connection.as_ref().is_none() {
+            return false;
+        }
+
+        let connection = connection.unwrap();
+        let run = move || {
+            let result = connection.ssh(command);
+            Self::return_connection(connection);
+            result
+        };
+        let _ = self.thread_pool().execute(run, callback);
+
+        true
+    }
+
+    pub fn scp<C>(&self, content: String, dest_path: String, callback: C)
+    where
+        C: Fn(Result<String>) + Send + 'static,
+    {
+        let run = move || {
+            let connection = Self::get_connection();
+            let result = loop {
+                thread::sleep(Duration::from_secs(1));
+                match connection.scp(&content, &dest_path) {
+                    Ok(result) => break Ok(result),
+                    Err(e) => {
+                        println!("scp file error: {:?}", e);
+                    }
+                }
+            };
+            Self::return_connection(connection);
+            result
+        };
+        self.thread_pool().execute(run, callback);
+    }
+
+    pub fn try_scp<C>(&self, content: String, dest_path: String, callback: C) -> bool
+    where
+        C: Fn(Result<String>) + Send + 'static,
+    {
+        let connection = Self::try_get_connection();
+        if connection.is_none() {
+            return false;
+        }
+        let connection = connection.unwrap();
+        let run = move || {
+            let result = connection.scp(&content, &dest_path);
+
+            Self::return_connection(connection);
+            result
+        };
+        self.thread_pool().execute(run, callback);
+
+        true
+    }
+
+    fn get_connection() -> SSHConnection {
+        let mut connections = CONNECTIONS.lock().unwrap();
+        if let Some(connection) = connections.pop() {
+            if connection.authenticated() {
+                connection
+            } else {
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                    if let Some(connection) = SSHConnection::new() {
+                        break connection;
+                    }
+                }
+            }
+        } else {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                if let Some(connection) = SSHConnection::new() {
+                    if connection.authenticated() {
+                        break connection;
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_get_connection() -> Option<SSHConnection> {
+        let mut connections = CONNECTIONS.lock().unwrap();
+        if let Some(connection) = connections.pop() {
+            if connection.authenticated() {
+                return Some(connection);
+            }
+        }
+
+        None
+    }
+
+    fn return_connection(connection: SSHConnection) -> bool {
+        if !connection.authenticated() {
+            return false;
+        }
+
+        let mut connections = CONNECTIONS.lock().unwrap();
+        connections.push(connection);
+
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::Error;
+    use std::{
+        thread,
+        time::{Duration, SystemTime},
+    };
+
+    use super::SSHConnectionPool;
+    type Result<T> = std::result::Result<T, Error>;
+
+    #[test]
+    fn test_ssh() {
+        let ssh_connection_pool = SSHConnectionPool::new();
+
         let callback = |res: Result<String>| {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_micros();
             println!("{}", now);
-            println!("exec command result: {:#?}", res)
+            println!("exec command result: {:#?}", res);
         };
 
-        let _ = self.thread_pool().execute(run, callback);
-    }
+        ssh_connection_pool.ssh("cat /home/dev/test.txt".to_string(), callback);
 
-    fn get_connection() -> SSHConnection {
-        let mut connections = CONNECTIONS.lock().unwrap();
-        if let Some(connection) = connections.pop() {
-            println!("connection1");
-            connection
-        } else {
-            println!("connection2");
-            SSHConnection::new()
+        for i in 0..1000 {
+            println!("main sleep {i}");
+            thread::sleep(Duration::from_secs(1));
         }
     }
-
-    fn return_connection(connection: SSHConnection) {
-        let mut connections = CONNECTIONS.lock().unwrap();
-        connections.push(connection);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{thread, time::Duration};
-
-    use super::SSHConnectionPool;
 
     #[test]
-    fn test_ssh() {
+    fn test_scp() {
         let ssh_connection_pool = SSHConnectionPool::new();
-        for i in 0..100 {
-            ssh_connection_pool.ssh("ls -al".to_string());
-        }
 
-        thread::sleep(Duration::from_secs(100));
+        let callback = |res: Result<String>| {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros();
+            println!("{}", now);
+            println!("exec command result: {:#?}", res);
+            let ssh_connection_pool = SSHConnectionPool::new();
+            ssh_connection_pool.ssh(
+                "cat /home/dev/test.txt".to_string(),
+                |res: Result<String>| println!("{:?}", res),
+            );
+        };
+
+        ssh_connection_pool.scp(
+            "hello scpssssss".to_string(),
+            "/home/dev/test.txt".to_string(),
+            callback,
+        );
+
+        for i in 0..1000 {
+            println!("main sleep {i}");
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 }
